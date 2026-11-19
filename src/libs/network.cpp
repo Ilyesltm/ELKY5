@@ -1110,24 +1110,96 @@ static int ConvertSocketOptionLevel(int level) {
 	return (level == 0xffff ? SOL_SOCKET : level);
 }
 
+// Guest SOL_SOCKET option values come from FreeBSD sys/socket.h, except 0x1105/0x1106, which are
+// the SCE_NET_SO_SNDTIMEO/RCVTIMEO variants taking a four-byte microsecond value (0x1106 is
+// assumed by symmetry with 0x1105, unverified against an SDK).
+enum class SocketOptionValue { Raw, Boolean, Microseconds, BsdTimeval, BsdLinger };
+
+struct GuestSocketTimeval {
+	int64_t tv_sec;
+	int64_t tv_usec;
+};
+static_assert(sizeof(GuestSocketTimeval) == 0x10);
+
+struct GuestSocketLinger {
+	int32_t l_onoff;
+	int32_t l_linger;
+};
+static_assert(sizeof(GuestSocketLinger) == 0x8);
+
+#if defined(_WIN32)
+using HostSocketTimeout = DWORD;
+#else
+using HostSocketTimeout = timeval;
+#endif
+
+static SocketOptionValue GetSocketOptionValue(int level, int option) {
+	if (level != 0xffff) {
+		return SocketOptionValue::Raw;
+	}
+	switch (option) {
+		case 0x0004:
+		case 0x0008:
+		case 0x0010:
+		case 0x0020:
+		case 0x0100: return SocketOptionValue::Boolean;
+		case 0x0080: return SocketOptionValue::BsdLinger;
+		case 0x1005:
+		case 0x1006: return SocketOptionValue::BsdTimeval;
+		case 0x1105:
+		case 0x1106: return SocketOptionValue::Microseconds;
+		default: return SocketOptionValue::Raw;
+	}
+}
+
 static int ConvertSocketOptionName(int level, int option) {
 	if (level == 0xffff) {
 		switch (option) {
 			case 0x0004: return SO_REUSEADDR;
+			case 0x0008: return SO_KEEPALIVE;
+			case 0x0010: return SO_DONTROUTE;
 			case 0x0020: return SO_BROADCAST;
+			case 0x0080: return SO_LINGER;
+			case 0x0100: return SO_OOBINLINE;
 			case 0x1001: return SO_SNDBUF;
 			case 0x1002: return SO_RCVBUF;
-			case 0x1007: return SO_ERROR;
+			case 0x1003: return SO_SNDLOWAT;
+			case 0x1004: return SO_RCVLOWAT;
+			case 0x1005:
 			case 0x1105: return SO_SNDTIMEO;
+			case 0x1006:
+			case 0x1106: return SO_RCVTIMEO;
+			case 0x1007: return SO_ERROR;
+			case 0x1008: return SO_TYPE;
 			default: break;
 		}
 	} else if (level == 6 && option == 1) {
 		return TCP_NODELAY;
 	}
-#if defined(_WIN32)
-	return option;
-#else
+	// Host option numbers differ (Winsock, Linux), so unknown guest options are never forwarded.
+	LOGF("\t unsupported socket option: level = 0x%08" PRIx32 ", optname = 0x%08" PRIx32 "\n",
+	     static_cast<uint32_t>(level), static_cast<uint32_t>(option));
 	return -1;
+}
+
+static HostSocketTimeout MicrosecondsToHostTimeout(int64_t usec) {
+	usec = std::max<int64_t>(usec, 0);
+	HostSocketTimeout timeout {};
+#if defined(_WIN32)
+	timeout = static_cast<DWORD>(
+	    std::min<int64_t>((usec + 999) / 1000, std::numeric_limits<DWORD>::max()));
+#else
+	timeout.tv_sec  = static_cast<decltype(timeout.tv_sec)>(usec / 1'000'000);
+	timeout.tv_usec = static_cast<decltype(timeout.tv_usec)>(usec % 1'000'000);
+#endif
+	return timeout;
+}
+
+static int64_t HostTimeoutToMicroseconds(const HostSocketTimeout& timeout) {
+#if defined(_WIN32)
+	return static_cast<int64_t>(timeout) * 1000;
+#else
+	return static_cast<int64_t>(timeout.tv_sec) * 1'000'000 + timeout.tv_usec;
 #endif
 }
 
@@ -2239,39 +2311,68 @@ int ELKY5_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint3
 	}
 
 	const bool socket_error = (level == 0xffff && optname == 0x1007);
-	const bool send_timeout = (level == 0xffff && optname == 0x1105);
+	const auto value_kind   = GetSocketOptionValue(level, optname);
 	optname                = ConvertSocketOptionName(level, optname);
 	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
 	}
-#if defined(_WIN32)
-	DWORD timeout {};
-#else
-	timeval timeout {};
-#endif
-	SocketLength len = static_cast<SocketLength>(*optlen);
-	void*        value = optval;
-	if (send_timeout) {
-		if (*optlen < sizeof(int)) {
-			return SetGuestSocketError(Posix::POSIX_EINVAL);
-		}
-		value = &timeout;
-		len   = sizeof(timeout);
+	HostSocketTimeout timeout {};
+	linger            host_linger {};
+	int               host_flag = 0;
+	SocketLength      len       = static_cast<SocketLength>(*optlen);
+	void*             value     = optval;
+	switch (value_kind) {
+		case SocketOptionValue::Boolean:
+			if (*optlen < sizeof(int)) {
+				return SetGuestSocketError(Posix::POSIX_EINVAL);
+			}
+			value = &host_flag;
+			len   = sizeof(host_flag);
+			break;
+		case SocketOptionValue::Microseconds:
+		case SocketOptionValue::BsdTimeval:
+			if (*optlen < (value_kind == SocketOptionValue::Microseconds
+			                   ? sizeof(int)
+			                   : sizeof(GuestSocketTimeval))) {
+				return SetGuestSocketError(Posix::POSIX_EINVAL);
+			}
+			value = &timeout;
+			len   = sizeof(timeout);
+			break;
+		case SocketOptionValue::BsdLinger:
+			if (*optlen < sizeof(GuestSocketLinger)) {
+				return SetGuestSocketError(Posix::POSIX_EINVAL);
+			}
+			value = &host_linger;
+			len   = sizeof(host_linger);
+			break;
+		case SocketOptionValue::Raw: break;
 	}
 	if (::getsockopt(socket, ConvertSocketOptionLevel(level), optname, static_cast<char*>(value),
 	                 &len) != 0) {
 		return SetHostSocketError();
 	}
-	if (send_timeout) {
-#if defined(_WIN32)
-		const int64_t usec = static_cast<int64_t>(timeout) * 1000;
-#else
-		const int64_t usec = static_cast<int64_t>(timeout.tv_sec) * 1'000'000 + timeout.tv_usec;
-#endif
-		const int guest_timeout =
-		    static_cast<int>(std::min<int64_t>(usec, std::numeric_limits<int>::max()));
+	if (value_kind == SocketOptionValue::Boolean) {
+		// Winsock may report a one-byte BOOLEAN (SO_KEEPALIVE); the guest always reads an int.
+		const int guest_flag = host_flag != 0 ? 1 : 0;
+		std::memcpy(optval, &guest_flag, sizeof(guest_flag));
+		len = sizeof(guest_flag);
+	} else if (value_kind == SocketOptionValue::Microseconds) {
+		const int guest_timeout = static_cast<int>(
+		    std::min<int64_t>(HostTimeoutToMicroseconds(timeout), std::numeric_limits<int>::max()));
 		std::memcpy(optval, &guest_timeout, sizeof(guest_timeout));
 		len = sizeof(guest_timeout);
+	} else if (value_kind == SocketOptionValue::BsdTimeval) {
+		const int64_t      usec = HostTimeoutToMicroseconds(timeout);
+		GuestSocketTimeval guest_timeout {usec / 1'000'000, usec % 1'000'000};
+		std::memcpy(optval, &guest_timeout, sizeof(guest_timeout));
+		len = sizeof(guest_timeout);
+	} else if (value_kind == SocketOptionValue::BsdLinger) {
+		// Winsock returns u_short fields; the guest layout is FreeBSD's pair of ints.
+		GuestSocketLinger guest_linger {host_linger.l_onoff != 0 ? 1 : 0,
+		                                static_cast<int32_t>(host_linger.l_linger)};
+		std::memcpy(optval, &guest_linger, sizeof(guest_linger));
+		len = sizeof(guest_linger);
 	}
 	if (socket_error && len >= static_cast<SocketLength>(sizeof(int))) {
 		auto* error = static_cast<int*>(optval);
@@ -2351,31 +2452,58 @@ int ELKY5_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval,
 #endif
 		return failed ? SetHostSocketError() : 0;
 	}
-	const bool send_timeout = (level == 0xffff && optname == 0x1105);
-	optname                = ConvertSocketOptionName(level, optname);
+	const auto value_kind = GetSocketOptionValue(level, optname);
+	optname               = ConvertSocketOptionName(level, optname);
 	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
 	}
-#if defined(_WIN32)
-	DWORD timeout {};
-#else
-	timeval timeout {};
-#endif
-	if (send_timeout) {
-		if (optlen != sizeof(int)) {
-			return SetGuestSocketError(Posix::POSIX_EINVAL);
+	HostSocketTimeout timeout {};
+	linger            host_linger {};
+	switch (value_kind) {
+		case SocketOptionValue::Microseconds: {
+			if (optlen != sizeof(int)) {
+				return SetGuestSocketError(Posix::POSIX_EINVAL);
+			}
+			int usec = 0;
+			std::memcpy(&usec, optval, sizeof(usec));
+			timeout = MicrosecondsToHostTimeout(usec);
+			optval  = &timeout;
+			optlen  = sizeof(timeout);
+			break;
 		}
-		int usec = 0;
-		std::memcpy(&usec, optval, sizeof(usec));
-		usec = std::max(usec, 0);
-#if defined(_WIN32)
-		timeout = static_cast<DWORD>((static_cast<int64_t>(usec) + 999) / 1000);
-#else
-		timeout.tv_sec  = usec / 1'000'000;
-		timeout.tv_usec = usec % 1'000'000;
-#endif
-		optval = &timeout;
-		optlen = sizeof(timeout);
+		case SocketOptionValue::BsdTimeval: {
+			if (optlen < sizeof(GuestSocketTimeval)) {
+				return SetGuestSocketError(Posix::POSIX_EINVAL);
+			}
+			GuestSocketTimeval tv {};
+			std::memcpy(&tv, optval, sizeof(tv));
+			// FreeBSD sosetopt rejects negative or unnormalized timeouts with EDOM.
+			if (tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1'000'000) {
+				return SetGuestSocketError(Posix::POSIX_EDOM);
+			}
+			constexpr int64_t max_sec = std::numeric_limits<int64_t>::max() / 1'000'000 - 1;
+			timeout =
+			    MicrosecondsToHostTimeout(std::min(tv.tv_sec, max_sec) * 1'000'000 + tv.tv_usec);
+			optval = &timeout;
+			optlen = sizeof(timeout);
+			break;
+		}
+		case SocketOptionValue::BsdLinger: {
+			if (optlen < sizeof(GuestSocketLinger)) {
+				return SetGuestSocketError(Posix::POSIX_EINVAL);
+			}
+			GuestSocketLinger guest_linger {};
+			std::memcpy(&guest_linger, optval, sizeof(guest_linger));
+			using LingerTime     = decltype(host_linger.l_linger);
+			host_linger.l_onoff  = guest_linger.l_onoff != 0 ? 1 : 0;
+			host_linger.l_linger = static_cast<LingerTime>(std::clamp<int64_t>(
+			    guest_linger.l_linger, 0, std::numeric_limits<LingerTime>::max()));
+			optval               = &host_linger;
+			optlen               = sizeof(host_linger);
+			break;
+		}
+		case SocketOptionValue::Boolean:
+		case SocketOptionValue::Raw: break;
 	}
 
 	if (::setsockopt(socket, ConvertSocketOptionLevel(level), optname,

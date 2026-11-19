@@ -2217,8 +2217,8 @@ std::array<int, 2> CreateTcpPair() {
 void CheckSocketReceiveConcurrency() {
   namespace Net = Libs::Network::Net;
   const auto [reader, writer] = CreateTcpPair();
-  const int timeout_ms = 3000;
-  Check(Net::Setsockopt(reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0,
+  const int timeout_us = 3000000;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1106, &timeout_us, sizeof(timeout_us)) == 0,
         "bound the blocked receive concurrency fixture");
   std::promise<void> entered;
   std::promise<int64_t> completed;
@@ -2252,7 +2252,7 @@ void CheckSocketReceiveConcurrency() {
   Check(Net::SocketClose(writer) == 0, "close blocked receive writer");
 
   const auto [shutdown_reader, shutdown_writer] = CreateTcpPair();
-  Check(Net::Setsockopt(shutdown_reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0 &&
+  Check(Net::Setsockopt(shutdown_reader, 0xffff, 0x1106, &timeout_us, sizeof(timeout_us)) == 0 &&
             Net::Send(shutdown_writer, "x", 1, 0) == 1 &&
             Net::Recv(shutdown_reader, &byte, 1, 0x42) == 1 && byte == 'x' &&
             Net::Shutdown(shutdown_reader, 0) == 0 &&
@@ -2267,8 +2267,8 @@ void CheckSocketReceiveBuffer(int reader, int writer) {
   namespace Net = Libs::Network::Net;
   constexpr int PeekWaitAll = 0x42;
   constexpr char Payload[] = "abcdef";
-  const int timeout_ms = 2000;
-  Check(Net::Setsockopt(reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0,
+  const int timeout_us = 2000000;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1106, &timeout_us, sizeof(timeout_us)) == 0,
         "bound blocking receive regressions with SO_RCVTIMEO");
   Check(Net::Send(writer, Payload, 2, 0) == 2, "send first TCP fragment");
   std::jthread sender([&] {
@@ -2381,7 +2381,7 @@ void CheckSocketReceiveBuffer(int reader, int writer) {
   Check(datagram >= 0 && datagram_writer >= 0 &&
             Net::Bind(datagram, address.data(), address.size()) == 0 &&
             Net::Getsockname(datagram, address.data(), &address_size) == 0 &&
-            Net::Setsockopt(datagram, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0 &&
+            Net::Setsockopt(datagram, 0xffff, 0x1106, &timeout_us, sizeof(timeout_us)) == 0 &&
             Net::Sendto(datagram_writer, Payload, 6, 0, address.data(), address_size) == 6,
         "create bounded UDP truncation fixture");
   *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
@@ -2940,6 +2940,59 @@ void CheckSocketWakeup() {
             Libs::Network::NET_ERROR_ENOPROTOOPT &&
             *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
         "Net unknown socket options return protocol-option errors");
+  for (const int value : {1, 0}) {
+    int actual = -1;
+    uint32_t size = sizeof(actual);
+    Check(net_setsockopt(writer, 0xffff, 0x8, &value, sizeof(value)) == 0 &&
+              net_getsockopt(writer, 0xffff, 0x8, &actual, &size) == 0 &&
+              (actual != 0) == (value != 0) && size == sizeof(actual),
+          "Net SO_KEEPALIVE round-trips through the guest option number");
+  }
+  for (const int value : {1500000, 0, -1}) {
+    int actual = -2;
+    uint32_t size = sizeof(actual);
+    Check(net_setsockopt(datagram, 0xffff, 0x1106, &value, sizeof(value)) == 0 &&
+              net_getsockopt(datagram, 0xffff, 0x1106, &actual, &size) == 0 &&
+              actual == std::max(value, 0) && size == sizeof(actual),
+          "Net receive timeout round-trips four-byte microseconds");
+  }
+  {
+    const std::array<int64_t, 2> requested {2, 500000};
+    std::array<int64_t, 2> actual {-1, -1};
+    uint32_t size = sizeof(actual);
+    Check(net_setsockopt(datagram, 0xffff, 0x1006, requested.data(), sizeof(requested)) == 0 &&
+              net_getsockopt(datagram, 0xffff, 0x1006, actual.data(), &size) == 0 &&
+              actual == requested && size == sizeof(actual),
+          "BSD SO_RCVTIMEO round-trips a guest timeval");
+    const std::array<int64_t, 2> unnormalized {0, 1000000};
+    Check(net_setsockopt(datagram, 0xffff, 0x1006, unnormalized.data(), sizeof(unnormalized)) ==
+                  Libs::Network::NET_ERROR_EDOM &&
+              *net_errno == Libs::Posix::POSIX_EDOM &&
+              net_setsockopt(datagram, 0xffff, 0x1006, requested.data(), sizeof(int)) ==
+                  Libs::Network::NET_ERROR_EINVAL &&
+              *net_errno == Libs::Posix::POSIX_EINVAL,
+          "BSD SO_RCVTIMEO rejects unnormalized and undersized timevals");
+    const int disabled = 0;
+    Check(net_setsockopt(datagram, 0xffff, 0x1106, &disabled, sizeof(disabled)) == 0,
+          "disable the datagram receive timeout");
+  }
+  for (const std::array<int32_t, 2> requested :
+       {std::array<int32_t, 2> {1, 5}, std::array<int32_t, 2> {0, 0}}) {
+    std::array<int32_t, 2> actual {-1, -1};
+    uint32_t size = sizeof(actual);
+    Check(net_setsockopt(writer, 0xffff, 0x80, requested.data(), sizeof(requested)) == 0 &&
+              net_getsockopt(writer, 0xffff, 0x80, actual.data(), &size) == 0 &&
+              actual[0] == requested[0] && (requested[0] == 0 || actual[1] == requested[1]) &&
+              size == sizeof(actual),
+          "Net SO_LINGER round-trips the FreeBSD two-int layout");
+  }
+  {
+    int type = -1;
+    uint32_t size = sizeof(type);
+    Check(net_getsockopt(datagram, 0xffff, 0x1008, &type, &size) == 0 && type == 2 &&
+              size == sizeof(type),
+          "Net SO_TYPE reports the guest datagram type");
+  }
 #if defined(__linux__)
   Check(net_setsockopt(datagram, 0xffff, 0x1007, &timeout, option_size) ==
             Libs::Network::NET_ERROR_ENOPROTOOPT &&
