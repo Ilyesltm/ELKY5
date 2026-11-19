@@ -1,0 +1,16 @@
+#include "cmake_config.h"
+
+#define ELKY5_GIT_VERSION "@ELKY5_GIT_VERSION@"
+// Short, human-facing commit name used in build labels.
+#define ELKY5_GIT_HASH "@ELKY5_GIT_HASH@"
+// Full commit identity used for compatibility checks.
+#define ELKY5_GIT_REVISION "@ELKY5_GIT_REVISION@"
+
+/* Build provenance, shown in the window title and in crash reports. */
+#if defined(ELKY5_OFFICIAL_BUILD)
+#define ELKY5_BUILD_LABEL "Official build " ELKY5_RELEASE_TAG
+#elif defined(ELKY5_FORK_BUILD)
+#define ELKY5_BUILD_LABEL "Fork build " ELKY5_BUILD_REPOSITORY " " ELKY5_GIT_HASH
+#else
+#define ELKY5_BUILD_LABEL "Source build " ELKY5_GIT_HASH
+#endif

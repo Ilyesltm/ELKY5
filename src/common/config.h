@@ -1,0 +1,15 @@
+#ifndef ELKY5_COMMON_CONFIG_H_
+#define ELKY5_COMMON_CONFIG_H_
+
+#define ELKY5_PLATFORM_WINDOWS 1
+#define ELKY5_PLATFORM_LINUX   5
+
+#define ELKY5_COMPILER_GCC   1
+#define ELKY5_COMPILER_CLANG 2
+
+#define ELKY5_BUILD_DEBUG   1
+#define ELKY5_BUILD_RELEASE 2
+
+#include "cmake_config.h"
+
+#endif /* ELKY5_COMMON_CONFIG_H_ */

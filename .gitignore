@@ -1,0 +1,60 @@
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+/_Build/
+/build/
+/build-*/
+/out/
+cmake-build-*/
+CMakeUserPresets.json
+compile_commands.json
+/result
+/result-*
+
+# ---------------------------------------------------------------------------
+# Emulator runtime data (created in the working directory when running a game)
+# ---------------------------------------------------------------------------
+/_DownloadData/
+/_TempData/
+/_SaveData/
+/_Trophies/
+/_PipelineCache/
+/_Shaders/
+/_Buffers/
+/_RenderDoc/
+/_Patches/
+*.log
+*.rdc
+
+# ---------------------------------------------------------------------------
+# IDEs and tools
+# ---------------------------------------------------------------------------
+.vs/
+.idea/
+.cache/
+.clangd/
+*.user
+*.suo
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+
+# ---------------------------------------------------------------------------
+# Claude Code: local only, never pushed
+# ---------------------------------------------------------------------------
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+
+# ---------------------------------------------------------------------------
+# Python / OS / editor junk
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+*.orig
+*.rej

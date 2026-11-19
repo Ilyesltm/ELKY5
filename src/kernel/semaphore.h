@@ -1,0 +1,44 @@
+#ifndef EMULATOR_INCLUDE_EMULATOR_KERNEL_SEMAPHORE_H_
+#define EMULATOR_INCLUDE_EMULATOR_KERNEL_SEMAPHORE_H_
+
+#include "common/abi.h"
+#include "common/common.h"
+#include "kernel/pthread.h"
+
+namespace Libs::LibKernel::Semaphore {
+
+class KernelSemaPrivate;
+
+using KernelSema = KernelSemaPrivate*;
+
+int ELKY5_SYSV_ABI KernelCreateSema(KernelSema* sem, const char* name, uint32_t attr, int init,
+                                   int max, void* opt);
+int ELKY5_SYSV_ABI KernelDeleteSema(KernelSema sem);
+int ELKY5_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time);
+int ELKY5_SYSV_ABI KernelPollSema(KernelSema sem, int need);
+int ELKY5_SYSV_ABI KernelSignalSema(KernelSema sem, int count);
+int ELKY5_SYSV_ABI KernelCancelSema(KernelSema sem, int count, int* threads);
+int ELKY5_SYSV_ABI PthreadSemInit(void* sem, int flag, unsigned int value, const char* name);
+int ELKY5_SYSV_ABI PthreadSemDestroy(void* sem);
+int ELKY5_SYSV_ABI PthreadSemWait(void* sem);
+int ELKY5_SYSV_ABI PthreadSemTrywait(void* sem);
+int ELKY5_SYSV_ABI PthreadSemTimedwait(void* sem, KernelUseconds usec);
+int ELKY5_SYSV_ABI PthreadSemPost(void* sem);
+int ELKY5_SYSV_ABI PthreadSemGetvalue(void* sem, int* value);
+
+} // namespace Libs::LibKernel::Semaphore
+
+namespace Libs::Posix {
+
+int ELKY5_SYSV_ABI sem_init(void* sem, int pshared, unsigned int value);
+int ELKY5_SYSV_ABI sem_destroy(void* sem);
+int ELKY5_SYSV_ABI sem_wait(void* sem);
+int ELKY5_SYSV_ABI sem_trywait(void* sem);
+int ELKY5_SYSV_ABI sem_reltimedwait_np(void* sem, uint32_t usec);
+int ELKY5_SYSV_ABI sem_timedwait(void* sem, const LibKernel::KernelTimespec* abstime);
+int ELKY5_SYSV_ABI sem_post(void* sem);
+int ELKY5_SYSV_ABI sem_getvalue(void* sem, int* value);
+
+} // namespace Libs::Posix
+
+#endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_SEMAPHORE_H_ */
