@@ -55,16 +55,6 @@ static void PrintSystemInfo() {
 	     std::thread::hardware_concurrency());
 }
 
-static void Elky5Close() {
-	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
-
-	rt->Clear();
-
-	LOGF("done!\n");
-
-	Common::Subsystems::EmergencyShutdownActive();
-}
-
 static void MountOrCreateDir(const std::filesystem::path& dir, const std::string& point) {
 	if (!Common::File::IsDirectoryExisting(dir)) {
 		Common::File::CreateDirectories(dir);
@@ -166,11 +156,9 @@ void Run(const RunOptions& options) {
 		Log::WriteToConsoleAndLog(fmt::format("Title ID: {}\n", title_id));
 	}
 
-	int ok = atexit(Elky5Close);
-	EXIT_NOT_IMPLEMENTED(ok != 0);
-
-	// Guest threads are still running, so skip Elky5Close() and only flush emergency state.
-	ok = at_quick_exit(Common::Subsystems::EmergencyShutdownActive);
+	// Normal and guest-requested exits use quick_exit: guest threads are still running, so only
+	// emergency state is flushed and nothing they use is torn down.
+	const int ok = at_quick_exit(Common::Subsystems::EmergencyShutdownActive);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
 
 	// /hostapp mounts the same folder writable.
