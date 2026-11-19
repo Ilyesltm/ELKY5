@@ -19,6 +19,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -71,7 +72,10 @@ const char** GetArgv() {
 static ELKY5_SYSV_ABI void exit(int code) {
 	PRINT_NAME();
 
-	::exit(code);
+	// Same reason as the libkernel exit(): host static destructors must not run under live
+	// threads.
+	std::fflush(nullptr);
+	std::quick_exit(code);
 }
 
 static void PrintAbortStringCandidate(const char* name, uint64_t addr) {

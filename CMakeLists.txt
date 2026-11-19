@@ -674,6 +674,9 @@ target_link_libraries(net_resolver_tests elky5_test_gtest)
 add_elky5_full_emulator_test(notification_tests "${ELKY5_TESTS_DIR}/NotificationTests.cpp")
 target_link_libraries(notification_tests elky5_test_gtest)
 
+add_elky5_full_emulator_test(process_exit_tests "${ELKY5_TESTS_DIR}/ProcessExitTests.cpp")
+target_link_libraries(process_exit_tests elky5_test_gtest)
+
 add_executable(dlss_tests EXCLUDE_FROM_ALL
 	"${ELKY5_TESTS_DIR}/DlssTests.cpp"
 	"${ELKY5_SOURCE_DIR}/graphics/host_gpu/renderer/upscaler/dlss.cpp")
@@ -791,6 +794,7 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
 	add_test(NAME notification COMMAND $<TARGET_FILE:notification_tests>)
+	add_test(NAME process_exit COMMAND $<TARGET_FILE:process_exit_tests>)
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
@@ -887,6 +891,7 @@ if(BUILD_TESTING)
 		playgo_tests
 		vr_tracker2_tests
 		notification_tests
+		process_exit_tests
 		psml_tests
 	)
 endif()

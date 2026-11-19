@@ -1679,7 +1679,11 @@ static void ELKY5_SYSV_ABI KernelDebugRaiseException(int /*c1*/, int /*c2*/) {
 static void ELKY5_SYSV_ABI exit(int code) {
 	PRINT_NAME();
 
-	::exit(code);
+	// The kernel ends the process together with its threads. ::exit() would run host static
+	// destructors while guest, GPU and window threads still use what they free, and the caller
+	// is itself on a guest stack, so end the process like closing the window does.
+	std::fflush(nullptr);
+	std::quick_exit(code);
 }
 
 static ELKY5_SYSV_ABI MallocReplace* KernelGetSanitizerMallocReplaceExternal() {
