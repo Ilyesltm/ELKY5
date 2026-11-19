@@ -372,6 +372,26 @@ static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path
 static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_path) {
 	return relative_path.find_first_of("<>:\"|?*") != std::string::npos;
 }
+
+// PS5 accepts 1023-byte guest paths, but Win32 rejects host paths from MAX_PATH - 12 UTF-16 units
+// (CreateDirectoryW) unless they use the extended-length prefix. The limit applies to the full
+// path, so mounts relative to the working directory (_DownloadData, _SaveData) are made absolute
+// before measuring.
+static std::filesystem::path ToExtendedLengthPath(const std::filesystem::path& path) {
+	constexpr size_t SHORTEST_LONG_PATH = 260 - 12;
+	if (path.native().starts_with(L"\\\\")) {
+		return path;
+	}
+	std::error_code error;
+	const auto      absolute = std::filesystem::absolute(path, error);
+	if (error || absolute.native().size() < SHORTEST_LONG_PATH ||
+	    absolute.native().starts_with(L"\\\\")) {
+		return path;
+	}
+	// Extended-length paths bypass Win32 normalization of '/', '.' and '..', and also keep
+	// trailing dots and spaces that Win32 strips from short paths ("save." vs "save").
+	return std::filesystem::path(L"\\\\?\\" + absolute.lexically_normal().native());
+}
 #endif
 
 std::filesystem::path MountPoints::ResolvePath(std::string_view mounted_name, bool* read_only) {
@@ -404,7 +424,7 @@ std::filesystem::path MountPoints::ResolvePath(std::string_view mounted_name, bo
 			::printf("FileSystem: Windows-incompatible guest filename: %.*s\n",
 			         static_cast<int>(mounted_name.size()), mounted_name.data());
 		}
-		return p.dir / native_rel_path;
+		return ToExtendedLengthPath(p.dir / native_rel_path);
 #else
 		return ResolvePathIgnoringCase(p.dir / native_rel_path);
 #endif
@@ -1249,6 +1269,38 @@ int ELKY5_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	return OK;
 }
 
+// PS5 limits are in bytes: PATH_MAX (1024) includes the NUL and NAME_MAX is 255. FreeBSD checks
+// NAME_MAX during lookup (a missing parent wins with ENOENT); this pre-scan reports ENAMETOOLONG.
+static bool IsValidGuestPathLength(const char* path) {
+	size_t component_length = 0;
+	for (size_t i = 0; path[i] != '\0'; ++i) {
+		if (i >= 1023) {
+			return false;
+		}
+		if (path[i] == '/') {
+			component_length = 0;
+		} else if (++component_length > 255) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Windows reports a regular file used as a directory component as ERROR_PATH_NOT_FOUND, whereas
+// the PS5 kernel returns ENOTDIR like POSIX hosts.
+static bool HasNonDirectoryAncestor(const std::filesystem::path& path) {
+	auto current = path.parent_path();
+	while (current.has_relative_path()) {
+		std::error_code error;
+		const auto      status = std::filesystem::status(current, error);
+		if (status.type() != std::filesystem::file_type::not_found) {
+			return !error && !std::filesystem::is_directory(status);
+		}
+		current = current.parent_path();
+	}
+	return false;
+}
+
 int ELKY5_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 	PRINT_NAME();
 	if (path == nullptr) {
@@ -1257,16 +1309,8 @@ int ELKY5_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 	if (path[0] != '/' || length < 0) {
 		return KERNEL_ERROR_EINVAL;
 	}
-	size_t component_length = 0;
-	for (size_t i = 0; path[i] != '\0'; ++i) {
-		if (i >= 1023) {
-			return KERNEL_ERROR_ENAMETOOLONG;
-		}
-		if (path[i] == '/') {
-			component_length = 0;
-		} else if (++component_length > 255) {
-			return KERNEL_ERROR_ENAMETOOLONG;
-		}
+	if (!IsValidGuestPathLength(path)) {
+		return KERNEL_ERROR_ENAMETOOLONG;
 	}
 	if (IsRandomDevice(path)) {
 		return OK;
@@ -1299,7 +1343,9 @@ int ELKY5_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 	}
 	if (error) {
 		switch (static_cast<std::errc>(error.default_error_condition().value())) {
-			case std::errc::no_such_file_or_directory: return KERNEL_ERROR_ENOENT;
+			case std::errc::no_such_file_or_directory:
+				return HasNonDirectoryAncestor(real_name) ? KERNEL_ERROR_ENOTDIR
+				                                          : KERNEL_ERROR_ENOENT;
 			case std::errc::not_a_directory: return KERNEL_ERROR_ENOTDIR;
 			case std::errc::filename_too_long: return KERNEL_ERROR_ENAMETOOLONG;
 			case std::errc::permission_denied: return KERNEL_ERROR_EACCES;
@@ -1504,7 +1550,7 @@ int ELKY5_SYSV_ABI KernelMkdir(const char* path, uint16_t mode) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	if (std::strlen(path) > 255) {
+	if (!IsValidGuestPathLength(path)) {
 		return KERNEL_ERROR_ENAMETOOLONG;
 	}
 
@@ -1535,7 +1581,7 @@ int ELKY5_SYSV_ABI KernelRmdir(const char* path) {
 		return KERNEL_ERROR_EFAULT;
 	}
 
-	if (std::strlen(path) > 255) {
+	if (!IsValidGuestPathLength(path)) {
 		return KERNEL_ERROR_ENAMETOOLONG;
 	}
 
@@ -1580,7 +1626,7 @@ int ELKY5_SYSV_ABI KernelCheckReachability(const char* path) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	if (std::strlen(path) > 255) {
+	if (!IsValidGuestPathLength(path)) {
 		return KERNEL_ERROR_ENAMETOOLONG;
 	}
 

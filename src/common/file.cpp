@@ -287,25 +287,34 @@ bool File::CreateDirectories(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
 		return false;
 	}
-    const auto normalized_path =
-        WithoutTrailingSeparator(path);
+	auto normalized_path = WithoutTrailingSeparator(path);
 
-    auto current_path = normalized_path.root_path();
+	std::filesystem::path::string_type prefix;
+#if ELKY5_PLATFORM == ELKY5_PLATFORM_WINDOWS
+	// "\\?\" parses as the root path, so appending "C:" would drop the extended-length prefix.
+	constexpr std::wstring_view EXTENDED_PREFIX = L"\\\\?\\";
+	if (normalized_path.native().starts_with(EXTENDED_PREFIX)) {
+		prefix          = EXTENDED_PREFIX;
+		normalized_path = normalized_path.native().substr(EXTENDED_PREFIX.size());
+	}
+#endif
 
-    for (const auto& component:
-         normalized_path.relative_path()) {
-        current_path /= component;
+	auto current_path = normalized_path.root_path();
 
-        if (IsDirectoryExisting(current_path)) {
-            continue;
-        }
+	for (const auto& component: normalized_path.relative_path()) {
+		current_path /= component;
+		const std::filesystem::path host_path = prefix + current_path.native();
 
-        if (!CreateDirectory(current_path)) {
-            return false;
-        }
-    }
+		if (IsDirectoryExisting(host_path)) {
+			continue;
+		}
 
-    return true;
+		if (!CreateDirectory(host_path)) {
+			return false;
+		}
+	}
+
+	return true;
 }
 
 bool File::DeleteFile(
