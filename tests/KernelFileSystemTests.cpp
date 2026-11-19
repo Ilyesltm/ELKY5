@@ -1528,6 +1528,145 @@ void CheckUnicodePaths(const std::filesystem::path &root) {
   FileSystem::Umount("/app0");
 }
 
+// PS5 limits count UTF-8 bytes: NAME_MAX is 255 and PATH_MAX (1024) includes the NUL.
+void CheckLongestUnicodePath(const std::filesystem::path &root) {
+  namespace Kernel = Libs::LibKernel;
+  // U+1F600 is 4 bytes in UTF-8 and a surrogate pair in UTF-16; U+65E5 is 3 bytes.
+  constexpr std::string_view Emoji = "\xf0\x9f\x98\x80";
+  constexpr std::string_view Kanji = "\xe6\x97\xa5";
+  std::string longest_name;
+  for (int i = 0; i < 63; ++i) {
+    longest_name += Emoji;
+  }
+  longest_name += Kanji;
+  Check(longest_name.size() == 255, "multibyte name fixture is NAME_MAX bytes");
+
+  const auto directory = root / "longest-unicode";
+  Check(std::filesystem::create_directory(directory), "create longest Unicode path directory");
+  FileSystem::Mount(directory, "/temp0");
+  const std::string guest_file = "/temp0/" + longest_name;
+  const int fd = FileSystem::KernelOpen(guest_file.c_str(), 0x601, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, "PS5", 3) == 3 &&
+            FileSystem::KernelClose(fd) == OK,
+        "create a file whose multibyte name is NAME_MAX bytes");
+  FileSystem::FileStat stat {};
+  Check(FileSystem::KernelStat(guest_file.c_str(), &stat) == OK && stat.st_size == 3,
+        "stat a NAME_MAX multibyte filename");
+
+  const int dir = FileSystem::KernelOpen("/temp0/", 0, 0);
+  Check(dir >= 3, "open longest Unicode path directory");
+  std::vector<char> entries(0x10000);
+  const int size = FileSystem::KernelGetdents(dir, entries.data(), static_cast<int>(entries.size()));
+  bool found = false;
+  for (int offset = 0; offset + 8 <= size;) {
+    uint16_t length = 0;
+    std::memcpy(&length, entries.data() + offset + 4, sizeof(length));
+    const auto name_length = static_cast<uint8_t>(entries[offset + 7]);
+    Check(length >= 8 + name_length + 1 && length <= size - offset,
+          "NAME_MAX directory record fits");
+    found = found || std::string_view(entries.data() + offset + 8, name_length) == longest_name;
+    offset += length;
+  }
+  Check(found && FileSystem::KernelClose(dir) == OK,
+        "getdents returns the NAME_MAX multibyte filename unchanged");
+
+  // Four 252-byte directories leave a 4-byte final component at PATH_MAX minus one.
+  std::string nested = "/temp0";
+  for (int depth = 0; depth < 4; ++depth) {
+    nested += "/" + longest_name.substr(0, 252);
+    Check(FileSystem::KernelMkdir(nested.c_str(), 0777) == OK,
+          "create nested multibyte directories beyond 255 path bytes");
+  }
+  std::string longest_path = nested + "/";
+  while (longest_path.size() + Kanji.size() <= 1023) {
+    longest_path += Kanji;
+  }
+  longest_path.append(1023 - longest_path.size(), 'z');
+  Check(longest_path.size() == 1023 &&
+            FileSystem::KernelTruncate(longest_path.c_str(), 0) == Kernel::KERNEL_ERROR_ENOENT,
+        "a missing multibyte path of PATH_MAX minus one bytes is accepted");
+  Check(FileSystem::KernelTruncate((longest_path + "z").c_str(), 0) ==
+            Kernel::KERNEL_ERROR_ENAMETOOLONG,
+        "a multibyte path of PATH_MAX bytes is rejected");
+  Check(FileSystem::KernelTruncate((guest_file + "z").c_str(), 0) ==
+            Kernel::KERNEL_ERROR_ENAMETOOLONG,
+        "a multibyte name above NAME_MAX bytes is rejected");
+  // Remove the deep tree through the guest API: host recursion would hit MAX_PATH.
+  Check(FileSystem::KernelCheckReachability(nested.c_str()) == OK,
+        "a deep multibyte directory is reachable");
+  Check(FileSystem::KernelUnlink(guest_file.c_str()) == OK,
+        "remove the NAME_MAX multibyte filename");
+  for (; nested != "/temp0"; nested.resize(nested.rfind('/'))) {
+    Check(FileSystem::KernelRmdir(nested.c_str()) == OK,
+          "remove the nested multibyte directories");
+  }
+  FileSystem::Umount("/temp0");
+}
+
+// Game mounts (_DownloadData, _SaveData) are relative to the working directory, so the host
+// length limit must be measured on the absolute path.
+void CheckRelativeLongMount(const std::filesystem::path &root) {
+  const auto working_directory = root / ("cwd-" + std::string(100, 'c'));
+  Check(std::filesystem::create_directories(working_directory / "rel"),
+        "create relative mount fixture");
+  const auto previous_directory = std::filesystem::current_path();
+  std::filesystem::current_path(working_directory);
+  FileSystem::Mount("rel", "/temp0");
+
+  // 63 emoji are 126 UTF-16 units: short relative to the mount, beyond MAX_PATH once absolute.
+  std::string name;
+  for (int i = 0; i < 63; ++i) {
+    name += "\xf0\x9f\x98\x80";
+  }
+  const std::string guest_file = "/temp0/" + name;
+  const auto relative_host = std::filesystem::path("rel") / Common::PathFromUtf8(name);
+#if defined(_WIN32)
+  Check(relative_host.native().size() < 248 &&
+            std::filesystem::absolute(relative_host).native().size() > 260,
+        "relative mount fixture crosses MAX_PATH only when absolute");
+#endif
+  const int fd = FileSystem::KernelOpen(guest_file.c_str(), 0x601, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, "PS5", 3) == 3 &&
+            FileSystem::KernelClose(fd) == OK,
+        "create a long file under a relative mount");
+  FileSystem::FileStat stat {};
+  Check(FileSystem::KernelStat(guest_file.c_str(), &stat) == OK && stat.st_size == 3,
+        "stat a long file under a relative mount");
+  const int dir = FileSystem::KernelOpen("/temp0/", 0, 0);
+  std::vector<char> entries(0x10000);
+  const int size = dir >= 3 ? FileSystem::KernelGetdents(dir, entries.data(),
+                                                         static_cast<int>(entries.size()))
+                            : -1;
+  bool found = false;
+  for (int offset = 0; offset + 8 <= size;) {
+    uint16_t length = 0;
+    std::memcpy(&length, entries.data() + offset + 4, sizeof(length));
+    const auto name_length = static_cast<uint8_t>(entries[offset + 7]);
+    found = found || std::string_view(entries.data() + offset + 8, name_length) == name;
+    offset += length;
+  }
+  Check(found && FileSystem::KernelClose(dir) == OK,
+        "getdents lists a long file under a relative mount");
+  Check(FileSystem::KernelUnlink(guest_file.c_str()) == OK,
+        "unlink a long file under a relative mount");
+
+  const std::string guest_directory = "/temp0/" + name.substr(0, 248) + "-dir";
+  Check(FileSystem::KernelMkdir(guest_directory.c_str(), 0777) == OK &&
+            FileSystem::KernelRmdir(guest_directory.c_str()) == OK,
+        "mkdir and rmdir a long directory under a relative mount");
+  // Implicit parent creation (O_CREAT, rename) must keep the extended-length prefix.
+  const auto nested = FileSystem::GetRealFilename(guest_directory + "/a/b");
+  Check(Common::File::CreateDirectories(nested) && Common::File::IsDirectoryExisting(nested),
+        "create long parent directories through an extended-length path");
+  Check(FileSystem::KernelRmdir((guest_directory + "/a/b").c_str()) == OK &&
+            FileSystem::KernelRmdir((guest_directory + "/a").c_str()) == OK &&
+            FileSystem::KernelRmdir(guest_directory.c_str()) == OK,
+        "remove long parent directories");
+
+  FileSystem::Umount("/temp0");
+  std::filesystem::current_path(previous_directory);
+}
+
 void CheckUnicodeLogPath(const std::filesystem::path &root) {
   Config::ConfigOptions options;
   options.printf_direction = Config::LogDirection::File;
@@ -2975,10 +3114,13 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  TestMutexHandoff();
-  TestCondWaitCancel();
-  TestStaticRwlockDestroy();
-  TestPendingSignalDispatch();
+  // --fs-only skips the pthread cases so file system failures can be isolated.
+  if (!(argc == 2 && std::string_view(argv[1]) == "--fs-only")) {
+    TestMutexHandoff();
+    TestCondWaitCancel();
+    TestStaticRwlockDestroy();
+    TestPendingSignalDispatch();
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");
@@ -3007,6 +3149,8 @@ int main(int argc, char** argv) {
   CheckArchiveMount(temporary.Path());
   CheckReadOnlyAppFolder(temporary.Path());
   CheckUnicodePaths(temporary.Path());
+  CheckLongestUnicodePath(temporary.Path());
+  CheckRelativeLongMount(temporary.Path());
   CheckUnicodeLogPath(temporary.Path());
   CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
