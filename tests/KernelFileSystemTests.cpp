@@ -2475,9 +2475,14 @@ void TestNetCtlHostIpv4() {
 }
 #endif
 
+// Writing Mode keeps the instantiations distinct: identical bodies are folded by the
+// linker (ICF) into one address, which NP then rejects as an already registered callback.
+volatile int g_last_np_state_mode = -1;
+
 template <int Mode>
 void ELKY5_SYSV_ABI RecordNpState(int user_id, uint32_t state, void* arg) {
   auto& event = *static_cast<std::array<int, 3>*>(arg);
+  g_last_np_state_mode = Mode;
   ++event[0];
   event[1] = user_id;
   event[2] = static_cast<int>(state);
@@ -2534,6 +2539,8 @@ void TestNpEmulation() {
   static std::array<std::array<int, 3>, 4> events {};
   const std::array<NpStateCallbackA, 4> callbacks {
       RecordNpState<0>, RecordNpState<1>, RecordNpState<2>, RecordNpState<3>};
+  Check(std::set<NpStateCallbackA>(callbacks.begin(), callbacks.end()).size() == callbacks.size(),
+        "each NP mode registers a distinct state callback");
   int mode = 0;
   for (bool network : {false, true}) {
     int previous_network_state = -1;
