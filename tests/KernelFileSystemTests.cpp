@@ -119,6 +119,9 @@ void TestStaticRwlockDestroy() {
         "static rwlock remains usable after destroying its untouched initializer");
 }
 
+// FreeBSD's PTHREAD_CANCELED, which guest code compares join results against.
+void *const kGuestPthreadCanceled = reinterpret_cast<void *>(1);
+
 struct MutexWaiter {
   Libs::LibKernel::PthreadMutex *mutex;
   Libs::LibKernel::KernelUseconds timeout = 0;
@@ -245,11 +248,81 @@ void TestMutexHandoff() {
   waiter.resume = 2;
   void *result = nullptr;
   Check(PthreadJoin(waiter.thread, &result) == OK &&
-            result == reinterpret_cast<void *>(-1) && waiter.acquired && waiter.finished,
+            result == kGuestPthreadCanceled && waiter.acquired && waiter.finished,
         "mutex lock defers cancellation until explicit cancellation point");
   Check(PthreadMutexLock(&mutex) == OK && PthreadMutexUnlock(&mutex) == OK &&
             PthreadMutexDestroy(&mutex) == OK && remove(30) == OK,
         "mutex remains usable after waiter cancellation");
+}
+
+struct CondCancelWaiter {
+  Libs::LibKernel::PthreadMutex mutex = nullptr;
+  Libs::LibKernel::PthreadCond cond = nullptr;
+  bool timed = false;
+  bool disable = false;
+  std::atomic<bool> waiting{false}, canceled{false}, returned{false};
+  int result = 0;
+};
+
+void *ELKY5_SYSV_ABI RunCondCancelWaiter(void *arg) {
+  using namespace Libs::LibKernel;
+  auto &waiter = *static_cast<CondCancelWaiter *>(arg);
+  Check(PthreadMutexLock(&waiter.mutex) == OK, "cancel waiter locks mutex");
+  int old_state = -1;
+  if (waiter.disable) {
+    Check(PthreadSetcancelstate(1, &old_state) == OK && old_state == 0,
+          "disable cancellation from the enabled default");
+  }
+  waiter.waiting = true;
+  do {
+    waiter.result = waiter.timed
+                        ? PthreadCondTimedwait(&waiter.cond, &waiter.mutex,
+                                               waiter.disable ? 50000 : 5000000)
+                        : PthreadCondWait(&waiter.cond, &waiter.mutex);
+  } while (!waiter.disable || (waiter.result == KERNEL_ERROR_ETIMEDOUT && !waiter.canceled));
+  waiter.returned = true;
+  Check(PthreadMutexUnlock(&waiter.mutex) == OK, "uncancelable waiter unlocks mutex");
+  Check(PthreadSetcancelstate(0, &old_state) == OK && old_state == 1, "enable cancellation");
+  PthreadTestcancel();
+  Check(false, "pending cancellation is acted upon once enabled");
+  return nullptr;
+}
+
+// Cancellation must exit through the guest entry frame, not by unwinding the guest stack.
+void TestCondWaitCancel() {
+  using namespace Libs::LibKernel;
+  for (int mode = 0; mode < 3; ++mode) {
+    CondCancelWaiter waiter;
+    waiter.timed = mode != 0;
+    waiter.disable = mode == 2;
+    Check(PthreadMutexInit(&waiter.mutex, nullptr, "CondCancel") == OK &&
+              PthreadCondInit(&waiter.cond, nullptr, "CondCancel") == OK,
+          "create cancel condition");
+    Pthread thread = nullptr;
+    Check(PthreadCreate(&thread, nullptr, RunCondCancelWaiter, &waiter, "CondCancel") == OK,
+          "create cancel waiter");
+    WaitForMutexTest([&] { return waiter.waiting.load(); });
+    // Taking the mutex proves the waiter released it inside the condition wait.
+    Check(PthreadMutexLock(&waiter.mutex) == OK && PthreadMutexUnlock(&waiter.mutex) == OK,
+          "cancel waiter blocks in condition wait");
+    const auto start = std::chrono::steady_clock::now();
+    Check(PthreadCancel(thread) == OK, "cancel condition waiter");
+    waiter.canceled = true;
+    void *result = nullptr;
+    Check(PthreadJoin(thread, &result) == OK && result == kGuestPthreadCanceled,
+          "join reports PTHREAD_CANCELED");
+    Check(std::chrono::steady_clock::now() - start < std::chrono::seconds(2),
+          "cancellation wakes a blocked condition waiter");
+    if (waiter.disable) {
+      Check(waiter.returned && waiter.result == KERNEL_ERROR_ETIMEDOUT &&
+                PthreadMutexDestroy(&waiter.mutex) == OK,
+            "disabled cancellation lets the condition wait time out");
+    } else {
+      Check(!waiter.returned && PthreadMutexTrylock(&waiter.mutex) == KERNEL_ERROR_EBUSY,
+            "canceled condition waiter exits with the mutex reacquired");
+    }
+    Check(PthreadCondDestroy(&waiter.cond) == OK, "destroy cancel condition");
+  }
 }
 
 int dispatched_signals = 0;
@@ -2903,6 +2976,7 @@ int main(int argc, char** argv) {
   }
 
   TestMutexHandoff();
+  TestCondWaitCancel();
   TestStaticRwlockDestroy();
   TestPendingSignalDispatch();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
