@@ -1587,7 +1587,14 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	}
 
 	const auto blocks = g_flexible_memory->PrepareMap(out_addr, len);
-	char       range_name[KERNEL_MAXIMUM_NAME_LENGTH];
+	// Host commit can run out before the guest budget does; Map below must not fail.
+	for (const auto& block: blocks) {
+		if (!g_guest_address_space->CommitBacking(block.backing_offset, block.size)) {
+			*addr_in_out = nullptr;
+			return KERNEL_ERROR_ENOMEM;
+		}
+	}
+	char range_name[KERNEL_MAXIMUM_NAME_LENGTH];
 	CopyVirtualRangeName(range_name, name);
 	{
 		std::lock_guard state(g_memory_state_mutex);
@@ -2567,6 +2574,19 @@ uint64_t TestGuestBackingSize() {
 	return g_guest_address_space->GetBackingSize();
 }
 
+uint64_t TestGuestBackingCommittedBytes() {
+	return g_guest_address_space->GetBackingCommittedBytes();
+}
+
+#if ELKY5_PLATFORM == ELKY5_PLATFORM_WINDOWS
+bool TestGuestBackingOffsetIsHostCommitted(uint64_t backing_offset) {
+	const auto               address = g_guest_address_space->GetBackingBase() + backing_offset;
+	MEMORY_BASIC_INFORMATION info {};
+	return VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) != 0 &&
+	       info.State == MEM_COMMIT;
+}
+#endif
+
 #if ELKY5_PLATFORM == ELKY5_PLATFORM_WINDOWS
 bool TestWindowsBackingViewModes() {
 	constexpr uint64_t size = 0x10000;
@@ -3150,6 +3170,13 @@ int ELKY5_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int 
 		std::vector<PooledMemory::Mapping> mappings;
 		if (!g_pooled_memory->Allocate(vaddr, len, &mappings)) {
 			return KERNEL_ERROR_ENOMEM;
+		}
+		// Host commit can run out before the pool does; the backing maps below must not fail.
+		for (const auto& mapping: mappings) {
+			if (!g_guest_address_space->CommitBacking(mapping.phys_addr, mapping.size)) {
+				EXIT_IF(!g_pooled_memory->Release(vaddr, len));
+				return KERNEL_ERROR_ENOMEM;
+			}
 		}
 		// Validation precedes the first backing map; failing after it is an emulator fault.
 		for (const auto& mapping: mappings) {

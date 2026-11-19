@@ -60,6 +60,8 @@
 
 #if ELKY5_PLATFORM == ELKY5_PLATFORM_WINDOWS
 #include <windows.h>
+// psapi.h needs the types windows.h declares.
+#include <psapi.h>
 #ifdef DeleteFile
 #undef DeleteFile
 #endif
@@ -68,6 +70,7 @@
 #if ELKY5_PLATFORM == ELKY5_PLATFORM_WINDOWS
 namespace Libs::LibKernel::Memory {
 bool TestWindowsBackingViewModes();
+bool TestGuestBackingOffsetIsHostCommitted(uint64_t backing_offset);
 }
 #endif
 
@@ -2478,6 +2481,106 @@ void TestWindowsBackingViewPermissions() {
 	const char* test = "WindowsBackingViewPermissions";
 	Check(test, Libs::LibKernel::Memory::TestWindowsBackingViewModes(),
 	      "backing view permissions differ from the requested mode");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// Committing the whole 12.4 GiB backing at boot fails with a small paging file, so it is committed
+// as views map it. Runs early so earlier tests have not committed much of it.
+void TestWindowsBackingCommitsOnDemand() {
+	const char* test = "WindowsBackingCommitsOnDemand";
+	namespace Memory = Libs::LibKernel::Memory;
+	constexpr uint64_t TwoGiB = uint64_t {2} << 30u;
+
+	const auto boot_committed = Memory::TestGuestBackingCommittedBytes();
+	Check(test, boot_committed < TwoGiB && boot_committed < Memory::TestGuestBackingSize(),
+	      "the backing was committed at boot: " + std::to_string(boot_committed));
+	Check(test,
+	      !Memory::TestGuestBackingOffsetIsHostCommitted(Memory::TestGuestBackingSize() - 0x10000),
+	      "unused backing pages are committed on the host");
+	PROCESS_MEMORY_COUNTERS_EX counters {};
+	counters.cb = sizeof(counters);
+	Check(test,
+	      GetProcessMemoryInfo(GetCurrentProcess(),
+	                           reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+	                           sizeof(counters)) != 0 &&
+	          counters.PrivateUsage < TwoGiB,
+	      "private usage after memory init: " + std::to_string(counters.PrivateUsage));
+
+	constexpr uint64_t size      = 0x100000;
+	int64_t            phys_addr = 0;
+	CheckOk(test,
+	        Memory::KernelAllocateDirectMemory(SceKernelDirectMemoryStart,
+	                                           Memory::KernelGetDirectMemorySize(), size, size,
+	                                           SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+	void* first  = nullptr;
+	void* second = nullptr;
+	CheckOk(test,
+	        Memory::KernelMapNamedDirectMemory(&first, size, SceKernelProtCpuRw, 0, phys_addr, 0,
+	                                           "commit_first"),
+	        "KernelMapNamedDirectMemory(first)");
+	CheckOk(test,
+	        Memory::KernelMapNamedDirectMemory(&second, size, SceKernelProtCpuRw, 0, phys_addr, 0,
+	                                           "commit_second"),
+	        "KernelMapNamedDirectMemory(second)");
+	const auto direct_committed = Memory::TestGuestBackingCommittedBytes();
+	Check(test, direct_committed > boot_committed && direct_committed >= size,
+	      "mapping direct memory did not commit its backing");
+	Check(test,
+	      Memory::TestGuestBackingOffsetIsHostCommitted(static_cast<uint64_t>(phys_addr)) &&
+	          Memory::TestGuestBackingOffsetIsHostCommitted(static_cast<uint64_t>(phys_addr) +
+	                                                        size - 0x10000),
+	      "mapped direct memory is not committed on the host");
+
+	auto* first_words  = static_cast<uint64_t*>(first);
+	auto* second_words = static_cast<const uint64_t*>(second);
+	for (uint64_t i = 0; i < size / sizeof(uint64_t); i += 0x200) {
+		first_words[i] = 0x434f4d4d49540000ull | i; // "COMMIT"
+	}
+	bool aliased = true;
+	for (uint64_t i = 0; i < size / sizeof(uint64_t); i += 0x200) {
+		aliased = aliased && second_words[i] == (0x434f4d4d49540000ull | i);
+	}
+	Check(test, aliased, "two views of committed direct memory do not share bytes");
+	MEMORY_BASIC_INFORMATION info {};
+	Check(test,
+	      VirtualQuery(second, &info, sizeof(info)) != 0 && info.State == MEM_COMMIT &&
+	          info.Type == MEM_MAPPED && info.RegionSize >= size,
+	      "the second view is not committed");
+
+	// A view mapped again over committed backing keeps its contents and commits nothing new.
+	CheckOk(test, Memory::KernelMunmap(reinterpret_cast<uint64_t>(first), size), "KernelMunmap");
+	void* third = nullptr;
+	CheckOk(test,
+	        Memory::KernelMapNamedDirectMemory(&third, size, SceKernelProtCpuRw, 0, phys_addr, 0,
+	                                           "commit_third"),
+	        "KernelMapNamedDirectMemory(third)");
+	Check(test, static_cast<const uint64_t*>(third)[0x200] == (0x434f4d4d49540000ull | 0x200),
+	      "a remapped view lost committed contents");
+	Check(test, Memory::TestGuestBackingCommittedBytes() == direct_committed,
+	      "remapping committed backing committed it again");
+
+	void* flexible = nullptr;
+	CheckOk(test,
+	        Memory::KernelMapNamedFlexibleMemory(&flexible, SceKernelPageSize * 2,
+	                                             SceKernelProtCpuRw, 0, "commit_flexible"),
+	        "KernelMapNamedFlexibleMemory");
+	static_cast<uint64_t*>(flexible)[0] = 0x464c4558434f4d4dull; // "FLEXCOMM"
+	uint64_t value                      = 0;
+	Check(test,
+	      Memory::TryReadBacking(reinterpret_cast<uint64_t>(flexible), &value, sizeof(value)) &&
+	          value == 0x464c4558434f4d4dull,
+	      "flexible memory backing is not committed");
+	Check(test, Memory::TestGuestBackingCommittedBytes() < TwoGiB,
+	      "small mappings committed too much backing");
+
+	CheckOk(test, Memory::KernelMunmap(reinterpret_cast<uint64_t>(flexible), SceKernelPageSize * 2),
+	        "KernelMunmap(flexible)");
+	CheckOk(test, Memory::KernelMunmap(reinterpret_cast<uint64_t>(second), size),
+	        "KernelMunmap(second)");
+	CheckOk(test, Memory::KernelMunmap(reinterpret_cast<uint64_t>(third), size),
+	        "KernelMunmap(third)");
+	CheckOk(test, Memory::KernelReleaseDirectMemory(phys_addr, size), "KernelReleaseDirectMemory");
 	std::printf("[host]    %-48s ok\n", test);
 }
 #endif
@@ -5979,6 +6082,9 @@ int main(int argc, char** argv) {
 	}
 
 	RunTest(TestFlexibleZeroingTracksBackingLifetime);
+#if ELKY5_PLATFORM == ELKY5_PLATFORM_WINDOWS
+	RunTest(TestWindowsBackingCommitsOnDemand);
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
 	RunTest(TestSmallFiberStacksAndMigration);
 #endif

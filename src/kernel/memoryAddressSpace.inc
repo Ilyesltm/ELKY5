@@ -33,19 +33,22 @@ public:
 		PlaceholderMapFailed,
 		ProtectFailed,
 		AddressRangeUnavailable,
+		CommitFailed,
 	};
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if ELKY5_PLATFORM == ELKY5_PLATFORM_WINDOWS
+		// A SEC_COMMIT section is charged in full against the system commit limit, which fails
+		// with a small paging file. Pages are committed when a guest view first maps them.
 		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE,
 		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
 		if (m_handle == nullptr) {
-			EXIT("could not reserve %" PRIu64 " MB for guest direct memory: 0x%08" PRIx32
-			     ". Windows commits\n"
-			     "this up front, so the paging file is usually what needs to be larger.\n",
+			EXIT("could not reserve %" PRIu64 " MB for guest direct memory: 0x%08" PRIx32 "\n",
 			     m_size / (1024U * 1024U), static_cast<uint32_t>(GetLastError()));
 		}
+		const auto chunks = (m_size + CommitChunk - 1u) / CommitChunk;
+		m_committed       = std::make_unique<std::atomic<uint64_t>[]>((chunks + 63u) / 64u);
 		m_backing_base = static_cast<uint8_t*>(
 		    MapViewOfFile(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
 		if (m_backing_base == nullptr) {
@@ -104,6 +107,7 @@ public:
 			case FailureReason::PlaceholderMapFailed: return "placeholder-map-failed";
 			case FailureReason::ProtectFailed: return "protect-failed";
 			case FailureReason::AddressRangeUnavailable: return "address-range-unavailable";
+			case FailureReason::CommitFailed: return "commit-failed";
 			default: return "unknown";
 		}
 	}
@@ -114,8 +118,73 @@ public:
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
+	// Commits the host pages of a backing range on the alias view; a committed section page is
+	// visible through every view. Every guest view commits its range before it is mapped, so all
+	// bytes guests and the GPU can reach are committed. Nothing is decommitted before shutdown.
+	bool Commit(uint64_t backing_offset, uint64_t size) {
+		if (size == 0) {
+			return true;
+		}
+		if (backing_offset > m_size || size > m_size - backing_offset) {
+			return false;
+		}
+#if ELKY5_PLATFORM == ELKY5_PLATFORM_WINDOWS
+		const auto      last = (backing_offset + size - 1u) / CommitChunk;
+		std::lock_guard lock(m_commit_mutex);
+		for (auto chunk = backing_offset / CommitChunk; chunk <= last;) {
+			if (IsChunkCommitted(chunk)) {
+				++chunk;
+				continue;
+			}
+			auto stop = chunk + 1u;
+			while (stop <= last && !IsChunkCommitted(stop)) {
+				++stop;
+			}
+			const auto start = chunk * CommitChunk;
+			const auto bytes = std::min(stop * CommitChunk, m_size) - start;
+			auto*      committed =
+			    VirtualAlloc(m_backing_base + start, bytes, MEM_COMMIT, PAGE_READWRITE);
+			if (committed == nullptr) {
+				LOGF_COLOR(Log::Color::Red,
+				           "\t direct-memory backing: commit of 0x%016" PRIx64
+				           " bytes at offset 0x%016" PRIx64 " failed: 0x%08" PRIx32 "\n",
+				           bytes, start, static_cast<uint32_t>(GetLastError()));
+				return false;
+			}
+			for (auto index = chunk; index < stop; ++index) {
+				m_committed[index / 64u].fetch_or(uint64_t {1} << (index % 64u),
+				                                  std::memory_order_release);
+			}
+			m_committed_bytes.fetch_add(bytes, std::memory_order_relaxed);
+			chunk = stop;
+		}
+#endif
+		return true;
+	}
+
+	[[nodiscard]] uint64_t GetCommittedBytes() const {
+#if ELKY5_PLATFORM == ELKY5_PLATFORM_WINDOWS
+		return m_committed_bytes.load(std::memory_order_relaxed);
+#else
+		return m_size;
+#endif
+	}
+
 	void ZeroRange(uint64_t backing_offset, uint64_t size) {
+#if ELKY5_PLATFORM == ELKY5_PLATFORM_WINDOWS
+		// A chunk reads as zero when it is first committed, so only committed chunks are cleared.
+		const auto end = backing_offset + size;
+		for (auto start = backing_offset; start < end;) {
+			const auto chunk     = start / CommitChunk;
+			const auto chunk_end = std::min(end, (chunk + 1u) * CommitChunk);
+			if (IsChunkCommitted(chunk)) {
+				std::memset(m_backing_base + start, 0, chunk_end - start);
+			}
+			start = chunk_end;
+		}
+#else
 		std::memset(m_backing_base + backing_offset, 0, size);
+#endif
 #if defined(ELKY5_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		g_test_backing_bytes_zeroed += size;
 #endif
@@ -181,6 +250,10 @@ public:
 		}
 #endif
 #if ELKY5_PLATFORM == ELKY5_PLATFORM_WINDOWS
+		if (!Commit(backing_offset, size)) {
+			SetFailure(failure_reason, FailureReason::CommitFailed);
+			return false;
+		}
 		if (!ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason)) {
 			return false;
 		}
@@ -402,7 +475,17 @@ private:
 		return UnmapViewOfFile2(GetCurrentProcess(), vaddr, MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
 
-	HANDLE m_handle = nullptr;
+	static constexpr uint64_t CommitChunk = 0x10000;
+
+	[[nodiscard]] bool IsChunkCommitted(uint64_t chunk) const {
+		return (m_committed[chunk / 64u].load(std::memory_order_acquire) &
+		        (uint64_t {1} << (chunk % 64u))) != 0;
+	}
+
+	HANDLE                                   m_handle = nullptr;
+	std::unique_ptr<std::atomic<uint64_t>[]> m_committed;
+	std::atomic<uint64_t>                    m_committed_bytes {0};
+	std::mutex                               m_commit_mutex;
 #elif ELKY5_PLATFORM == ELKY5_PLATFORM_LINUX
 	static int GetProtect(VirtualMemory::Mode mode) {
 		switch (mode) {
@@ -502,6 +585,14 @@ public:
 
 	void ZeroBacking(uint64_t backing_offset, uint64_t size) {
 		m_backing->ZeroRange(backing_offset, size);
+	}
+
+	bool CommitBacking(uint64_t backing_offset, uint64_t size) {
+		return m_backing->Commit(backing_offset, size);
+	}
+
+	[[nodiscard]] uint64_t GetBackingCommittedBytes() const {
+		return m_backing->GetCommittedBytes();
 	}
 
 	// The owned ranges are fixed at construction.
