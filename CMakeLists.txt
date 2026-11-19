@@ -795,6 +795,13 @@ if(BUILD_TESTING)
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
 	add_test(NAME notification COMMAND $<TARGET_FILE:notification_tests>)
 	add_test(NAME process_exit COMMAND $<TARGET_FILE:process_exit_tests>)
+	add_test(NAME slot_vector COMMAND $<TARGET_FILE:slot_vector_tests>)
+	add_test(NAME font COMMAND $<TARGET_FILE:font_tests>)
+	add_test(NAME dlss COMMAND $<TARGET_FILE:dlss_tests>)
+	add_test(NAME gpu_blit_shader COMMAND $<TARGET_FILE:gpu_blit_shader_tests>)
+	if (WIN32)
+		add_test(NAME fsr COMMAND $<TARGET_FILE:fsr_tests>)
+	endif()
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
@@ -893,7 +900,14 @@ if(BUILD_TESTING)
 		notification_tests
 		process_exit_tests
 		psml_tests
+		slot_vector_tests
+		font_tests
+		dlss_tests
+		gpu_blit_shader_tests
 	)
+	if (WIN32)
+		add_dependencies(elky5_tests fsr_tests)
+	endif()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.
