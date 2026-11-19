@@ -397,6 +397,10 @@ struct PthreadPrivate {
 	uint64_t              cond_sequence = 0;
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
+	// Guest cancellation is tracked here: host pthread_cancel would unwind the guest stack.
+	std::atomic_bool cancel_pending {false};
+	std::atomic_int  cancel_state {0};
+	std::atomic_int  cancel_type {0};
 #if ELKY5_PLATFORM == ELKY5_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -804,6 +808,40 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 	       second_capacity_unchanged && unmapped && final_capacity_unchanged;
 }
 #endif
+
+// FreeBSD (libthr) values seen by the guest.
+constexpr int GUEST_PTHREAD_CANCEL_ENABLE       = 0;
+constexpr int GUEST_PTHREAD_CANCEL_DISABLE      = 1;
+constexpr int GUEST_PTHREAD_CANCEL_DEFERRED     = 0;
+constexpr int GUEST_PTHREAD_CANCEL_ASYNCHRONOUS = 2;
+
+static void* GuestPthreadCanceled() {
+	return reinterpret_cast<void*>(1);
+}
+
+static bool PthreadCancelRequested(Pthread thread) {
+	return thread != nullptr && thread->cancel_state.load() == GUEST_PTHREAD_CANCEL_ENABLE &&
+	       thread->cancel_pending.load();
+}
+
+// Deferred cancellation only: asynchronous cancellation is acted upon at cancellation points too.
+// The caller must not hold any host lock, because PthreadExit discards the host frames.
+static void PthreadActOnCancel() {
+	auto* self = g_pthread_self;
+	if (!PthreadCancelRequested(self)) {
+		return;
+	}
+	// As in libthr, an exiting canceled thread cannot be canceled again.
+	self->cancel_state = GUEST_PTHREAD_CANCEL_DISABLE;
+	PthreadExit(GuestPthreadCanceled());
+}
+
+// A handler run from inside a wait must not exit while the thread is still queued as a waiter.
+static void DispatchPendingSignalWithoutCancel(Pthread thread) {
+	const int previous = thread->cancel_state.exchange(GUEST_PTHREAD_CANCEL_DISABLE);
+	KernelDispatchPendingSignalForCurrentThread();
+	thread->cancel_state = previous;
+}
 
 static ELKY5_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {
 #if defined(__x86_64__) || defined(_M_X64)
@@ -1278,9 +1316,9 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		return ETIMEDOUT;
 	}
 
-	// Guest mutex waits are not cancellation points, unlike the host condition wait.
-	int previous_cancel_state = 0;
-	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &previous_cancel_state);
+	// Guest mutex waits are not cancellation points; a signal handler run from this wait must not
+	// exit while the stack waiter is still queued.
+	const int previous_cancel_state = self->cancel_state.exchange(GUEST_PTHREAD_CANCEL_DISABLE);
 	PthreadMutexPrivate::Waiter waiter;
 	waiter.thread   = self;
 	waiter.previous = mutex->last_waiter;
@@ -1311,7 +1349,7 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		}
 	}
 	lock.unlock();
-	pthread_setcancelstate(previous_cancel_state, nullptr);
+	self->cancel_state = previous_cancel_state;
 	return result;
 }
 
@@ -2865,6 +2903,8 @@ int ELKY5_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 		return KERNEL_ERROR_EPERM;
 	}
 
+	PthreadActOnCancel();
+
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -2879,11 +2919,12 @@ int ELKY5_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(usec);
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	auto       wake     = [&ready, thread] { return ready() || PthreadCancelRequested(thread); };
 
 	if (usec == 0) {
 		result = ETIMEDOUT;
 	} else {
-		while (!ready()) {
+		while (!wake()) {
 			const auto now = std::chrono::steady_clock::now();
 			if (now >= deadline) {
 				break;
@@ -2896,9 +2937,9 @@ int ELKY5_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
 			thread->cond_cv.wait_for(cond_lock, poll);
 
-			if (!ready()) {
+			if (!wake()) {
 				cond_lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
+				DispatchPendingSignalWithoutCancel(thread);
 				cond_lock.lock();
 			}
 		}
@@ -2909,6 +2950,10 @@ int ELKY5_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	cond_lock.unlock();
 
 	int lock_result = NativeMutexLockRecurse(mutex_value, recurse);
+	if (result != OK && lock_result == OK) {
+		// POSIX: a canceled waiter reacquires the mutex first; host locks are released here.
+		PthreadActOnCancel();
+	}
 	if (result == OK) {
 		result = lock_result;
 	}
@@ -2954,6 +2999,8 @@ int ELKY5_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mute
 		return KERNEL_ERROR_EPERM;
 	}
 
+	PthreadActOnCancel();
+
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -2967,8 +3014,9 @@ int ELKY5_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mute
 	}
 
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	auto wake  = [&ready, thread] { return ready() || PthreadCancelRequested(thread); };
 
-	while (!ready()) {
+	while (!wake()) {
 		const auto now = std::chrono::steady_clock::now();
 		if (now >= deadline) {
 			break;
@@ -2981,9 +3029,9 @@ int ELKY5_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mute
 		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
 		thread->cond_cv.wait_for(cond_lock, poll);
 
-		if (!ready()) {
+		if (!wake()) {
 			cond_lock.unlock();
-			KernelDispatchPendingSignalForCurrentThread();
+			DispatchPendingSignalWithoutCancel(thread);
 			cond_lock.lock();
 		}
 	}
@@ -2993,6 +3041,10 @@ int ELKY5_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mute
 	cond_lock.unlock();
 
 	int lock_result = NativeMutexLockRecurse(mutex_value, recurse);
+	if (result != OK && lock_result == OK) {
+		// POSIX: a canceled waiter reacquires the mutex first; host locks are released here.
+		PthreadActOnCancel();
+	}
 	if (result == OK) {
 		result = lock_result;
 	}
@@ -3030,6 +3082,8 @@ int ELKY5_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return KERNEL_ERROR_EPERM;
 	}
 
+	PthreadActOnCancel();
+
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -3043,19 +3097,25 @@ int ELKY5_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	}
 
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	auto wake  = [&ready, thread] { return ready() || PthreadCancelRequested(thread); };
 
-	while (!ready()) {
+	while (!wake()) {
 		thread->cond_cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
-		if (!ready()) {
+		if (!wake()) {
 			cond_lock.unlock();
-			KernelDispatchPendingSignalForCurrentThread();
+			DispatchPendingSignalWithoutCancel(thread);
 			cond_lock.lock();
 		}
 	}
+	const bool signaled = ready();
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
 
 	result = NativeMutexLockRecurse(mutex_value, recurse);
+	if (!signaled && result == OK) {
+		// POSIX: a canceled waiter reacquires the mutex first; host locks are released here.
+		PthreadActOnCancel();
+	}
 
 	switch (result) {
 		case 0: return OK;
@@ -3292,6 +3352,9 @@ int ELKY5_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		created_thread->almost_done     = false;
 		created_thread->detached        = created_thread->attr->detached;
 		created_thread->unique_id       = -1;
+		created_thread->cancel_pending  = false;
+		created_thread->cancel_state    = GUEST_PTHREAD_CANCEL_ENABLE;
+		created_thread->cancel_type     = GUEST_PTHREAD_CANCEL_DEFERRED;
 
 		result =
 		    pthread_create(&created_thread->p, &created_thread->attr->p, RunThread, created_thread);
@@ -3382,15 +3445,13 @@ int ELKY5_SYSV_ABI PthreadCancel(Pthread thread) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
-	int result = pthread_cancel(thread->p);
+	thread->cancel_pending = true;
+	// Waiters poll for cancellation; the notify only shortens a blocked condition wait.
+	thread->cond_cv.notify_one();
 
-	LOGF("\tthread cancel: %s, %d\n", thread->name.c_str(), result);
+	LOGF("\tthread cancel: %s\n", thread->name.c_str());
 
-	switch (result) {
-		case 0: return OK;
-		case ESRCH: return KERNEL_ERROR_ESRCH;
-		default: return KERNEL_ERROR_EINVAL;
-	}
+	return OK;
 }
 
 int ELKY5_SYSV_ABI PthreadSetaffinity(Pthread thread, KernelCpumask mask) {
@@ -3421,59 +3482,65 @@ int ELKY5_SYSV_ABI PthreadGetaffinity(Pthread thread, KernelCpumask* mask) {
 int ELKY5_SYSV_ABI PthreadSetcancelstate(int state, int* old_state) {
 	PRINT_NAME();
 
-	int pstate = PTHREAD_CANCEL_DISABLE;
-
-	switch (state) {
-		case 0: pstate = PTHREAD_CANCEL_ENABLE; break;
-		case 1: pstate = PTHREAD_CANCEL_DISABLE; break;
-		default: EXIT("unknown state: %d", state);
+	if (state != GUEST_PTHREAD_CANCEL_ENABLE && state != GUEST_PTHREAD_CANCEL_DISABLE) {
+		return KERNEL_ERROR_EINVAL;
 	}
 
-	int result = pthread_setcancelstate(pstate, old_state);
-
-	LOGF("\tthread setcancelstate: %d\n", result);
-
-	if (old_state != nullptr) {
-		switch (*old_state) {
-			case PTHREAD_CANCEL_ENABLE: *old_state = 0; break;
-			case PTHREAD_CANCEL_DISABLE: *old_state = 1; break;
-			default: EXIT("unknown old_state: %d", *old_state);
+	auto* self = g_pthread_self;
+	if (self == nullptr) {
+		// Host threads have no guest handle, so they can never be canceled.
+		if (old_state != nullptr) {
+			*old_state = GUEST_PTHREAD_CANCEL_ENABLE;
 		}
-	}
-
-	if (result == 0) {
 		return OK;
 	}
-	return KERNEL_ERROR_EINVAL;
+
+	const int previous = self->cancel_state.exchange(state);
+	if (old_state != nullptr) {
+		*old_state = previous;
+	}
+
+	LOGF("\tthread setcancelstate: %d -> %d\n", previous, state);
+
+	if (state == GUEST_PTHREAD_CANCEL_ENABLE &&
+	    self->cancel_type.load() == GUEST_PTHREAD_CANCEL_ASYNCHRONOUS) {
+		// libthr acts on a pending request when re-enabling asynchronous cancellation.
+		PthreadActOnCancel();
+	}
+
+	return OK;
 }
 
 int ELKY5_SYSV_ABI PthreadSetcanceltype(int type, int* old_type) {
 	PRINT_NAME();
 
-	int ptype = PTHREAD_CANCEL_DEFERRED;
-
-	switch (type) {
-		case 0: ptype = PTHREAD_CANCEL_DEFERRED; break;
-		case 2: ptype = PTHREAD_CANCEL_ASYNCHRONOUS; break;
-		default: EXIT("unknown type: %d", type);
+	if (type != GUEST_PTHREAD_CANCEL_DEFERRED && type != GUEST_PTHREAD_CANCEL_ASYNCHRONOUS) {
+		return KERNEL_ERROR_EINVAL;
 	}
 
-	int result = pthread_setcanceltype(ptype, old_type);
-
-	LOGF("\tthread setcanceltype: %d\n", result);
-
-	if (old_type != nullptr) {
-		switch (*old_type) {
-			case PTHREAD_CANCEL_DEFERRED: *old_type = 0; break;
-			case PTHREAD_CANCEL_ASYNCHRONOUS: *old_type = 2; break;
-			default: EXIT("unknown type: %d", *old_type);
+	auto* self = g_pthread_self;
+	if (self == nullptr) {
+		// Host threads have no guest handle, so they can never be canceled.
+		if (old_type != nullptr) {
+			*old_type = GUEST_PTHREAD_CANCEL_DEFERRED;
 		}
-	}
-
-	if (result == 0) {
 		return OK;
 	}
-	return KERNEL_ERROR_EINVAL;
+
+	// The type is recorded only: cancellation is acted upon at cancellation points.
+	const int previous = self->cancel_type.exchange(type);
+	if (old_type != nullptr) {
+		*old_type = previous;
+	}
+
+	LOGF("\tthread setcanceltype: %d -> %d\n", previous, type);
+
+	if (type == GUEST_PTHREAD_CANCEL_ASYNCHRONOUS) {
+		// libthr acts on a pending request when switching to asynchronous cancellation.
+		PthreadActOnCancel();
+	}
+
+	return OK;
 }
 
 int ELKY5_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
@@ -3537,7 +3604,7 @@ int ELKY5_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 void ELKY5_SYSV_ABI PthreadTestcancel() {
 	PRINT_NAME();
 
-	pthread_testcancel();
+	PthreadActOnCancel();
 }
 
 void ELKY5_SYSV_ABI PthreadExit(void* value) {
